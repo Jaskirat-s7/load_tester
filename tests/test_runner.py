@@ -124,37 +124,84 @@ class TestRunnerBasic:
 class TestConcurrencyBound:
     async def test_in_flight_never_exceeds_limit(self, local_server: str):
         """
-        The runner tracks [current_in_flight, peak_in_flight].
+        The runner's tracker records peak concurrent in-flight requests.
         We use a slow endpoint so requests overlap and the semaphore is
-        exercised. Peak must not exceed concurrency.
+        genuinely exercised; peak must reach but never exceed concurrency.
         """
         concurrency = 4
         # /slow takes 0.3 s; with concurrency=4 and 12 requests they will
-        # definitely overlap — peak should be exactly concurrency.
-        results, _, in_flight = await run(
+        # definitely overlap — peak should saturate at exactly concurrency.
+        results, _, tracker = await run(
             url=f"{local_server}/slow",
             n_requests=12,
             concurrency=concurrency,
         )
-        peak = in_flight[1]
-        assert peak <= concurrency, f"Peak in-flight {peak} exceeded concurrency {concurrency}"
+        assert tracker.peak <= concurrency, (
+            f"Peak in-flight {tracker.peak} exceeded concurrency {concurrency}"
+        )
+        assert tracker.peak == concurrency, "Expected the semaphore to saturate"
+        assert tracker.current == 0, "All requests should have completed"
 
     async def test_concurrency_1_serialises_requests(self, local_server: str):
         """With concurrency=1 requests are strictly serialised."""
-        results, elapsed, in_flight = await run(
+        results, _, tracker = await run(
             url=f"{local_server}/ok",
             n_requests=5,
             concurrency=1,
         )
-        assert in_flight[1] == 1
+        assert tracker.peak == 1
         assert len(results) == 5
 
     async def test_semaphore_bounds_with_fast_endpoint(self, local_server: str):
         concurrency = 3
-        results, _, in_flight = await run(
+        results, _, tracker = await run(
             url=f"{local_server}/ok",
             n_requests=50,
             concurrency=concurrency,
         )
-        assert in_flight[1] <= concurrency
+        assert tracker.peak <= concurrency
         assert len(results) == 50
+
+
+# ---------------------------------------------------------------------------
+# End-to-end stats + failure handling
+# ---------------------------------------------------------------------------
+
+class TestEndToEnd:
+    async def test_stats_pipeline_against_live_server(self, local_server: str):
+        from loadtest.stats import compute_stats
+
+        results, elapsed, _ = await run(
+            url=f"{local_server}/ok",
+            n_requests=40,
+            concurrency=8,
+        )
+        stats = compute_stats(results, elapsed)
+        assert stats.total == 40
+        assert stats.succeeded == 40
+        assert stats.responded == 40
+        assert stats.latency is not None
+        assert stats.latency.min <= stats.latency.p50 <= stats.latency.max
+        assert stats.throughput_rps > 0
+
+    async def test_dead_host_all_connection_errors(self):
+        """
+        Hitting a closed port must not crash, and the failures' bogus latencies
+        must not produce a misleading latency report.
+        """
+        from loadtest.stats import compute_stats
+
+        # 127.0.0.1:1 is reserved and refuses connections immediately.
+        results, elapsed, _ = await run(
+            url="http://127.0.0.1:1/",
+            n_requests=6,
+            concurrency=3,
+            timeout_s=2.0,
+        )
+        assert len(results) == 6
+        assert all(not r.success for r in results)
+        stats = compute_stats(results, elapsed)
+        assert stats.succeeded == 0
+        assert stats.responded == 0
+        assert stats.latency is None  # no bogus percentiles invented
+        assert sum(stats.error_breakdown.values()) == 6

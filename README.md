@@ -45,6 +45,10 @@ loadtest https://httpbin.org/post -m POST \
 loadtest https://httpbin.org/get -n 100 -c 10 --json
 ```
 
+A one-line progress message is written to **stderr**; the results table (or JSON)
+goes to **stdout**, so `loadtest ... --json > out.json` captures only the data.
+The process exits non-zero (1) if every request failed, 2 on invalid arguments.
+
 ### Sample output
 
 ```
@@ -52,11 +56,11 @@ loadtest https://httpbin.org/get -n 100 -c 10 --json
   Load Test Results
 ==================================================
   Total requests:       100
-  Succeeded:            100
+  Succeeded (2xx):      100
   Failed:               0
   Throughput:           47.83 req/s
 
-  Latency (ms):
+  Latency (ms) — over 100 responded request(s):
     min:                89.42
     mean:               196.31
     p50:                182.14
@@ -74,6 +78,7 @@ loadtest https://httpbin.org/get -n 100 -c 10 --json
   "total": 100,
   "succeeded": 100,
   "failed": 0,
+  "responded": 100,
   "throughput_rps": 47.83,
   "latency_ms": {
     "min": 89.42,
@@ -87,6 +92,9 @@ loadtest https://httpbin.org/get -n 100 -c 10 --json
   "error_breakdown": {}
 }
 ```
+
+`latency_ms` is `null` when no request received a response (e.g. every request
+timed out or the host refused all connections).
 
 ## Tests
 
@@ -127,3 +135,14 @@ timeout budgets, and retry strategies should all be calibrated to tail behaviour
 `p50` (median) tells you what a typical request feels like; `p90/p95/p99` tell
 you how bad it gets for the unlucky minority. Optimising only the mean can leave
 the tail completely unaddressed.
+
+### Which requests count toward latency
+
+Latency percentiles are computed **only over requests that received an HTTP
+response** (any status, including non-2xx — those are genuine responses with
+real server timing). Timeouts and connection errors are excluded: a timeout's
+measured latency is just the timeout ceiling, and a refused connection is ~0 ms,
+so folding either into the distribution would distort it. Without this, pointing
+the tool at a dead host would report a flatteringly low "p99" built entirely
+from instant connection failures. Those failures still appear in the totals and
+the error breakdown — they're just not allowed to corrupt the latency numbers.
